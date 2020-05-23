@@ -15,16 +15,18 @@ where the `destination` argument can be the hostname or IP address.
 Use (Ctrl + C) or any interrupt signal to end the program and receive summary statistics.
 #### Options
 **-t ttl** set the IP time-to-live. Default 255. \
-**-i interval** set the interval between sending packets. \
+**-i interval** set the interval between sending packets in seconds. Default 1 second.\
+**-s packetsize** set the number of data bytes to be sent. Default 56 bytes.
 ## Output
 ```
 user:~/simple-ping$ sudo ./ping -t 9 -i 0.5 google.com 
+PING google.com 56(84) bytes of data.
 44 bytes from google.com: icmp_seq=1 ttl=57 time=21.529
 44 bytes from google.com: icmp_seq=2 ttl=57 time=19.554
 44 bytes from google.com: icmp_seq=3 ttl=57 time=19.123
 ^C
 --- google.com ping statistics ---
-3 packets transmitted, 3 received
+3 packets transmitted, 3 received, 0% packet loss
 rtt min/avg/max/stddev = 19.123/20.069/21.529/1.048 ms
 ```
 ## Credits

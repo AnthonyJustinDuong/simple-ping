@@ -10,9 +10,18 @@
 #include <netdb.h>
 #include <math.h>
 #include <errno.h>
+#include <signal.h>
 
+// IPv4
 #define IPV4_HDR_SIZE 20
 #define TTL_BYTE 8
+// ICMP
+#define ICMP_HDR_SIZE 8
+#define TYPE 0
+#define CODE 1
+#define CHECKSUM 2
+#define IDENTIFIER 4
+#define SEQ_NUM 6
 
 // Target host
 char *hostname;
@@ -22,18 +31,9 @@ struct sockaddr *hostaddr;
 // Options
 int ttl = 255;
 float interval = 1;
-	
-typedef struct {
-	uint8_t type;
-	uint8_t code;
-	uint16_t checksum;
-	uint16_t identifier;
-	uint16_t sequence_number;
-	struct timeval start_time;
-} icmp_header_t;
-// Packet ICMP header to send
-icmp_header_t hdr;
+int packetsize = 56;
 
+uint16_t uniq_id;
 // Summary statistics
 float min_time, max_time, total_time;
 float sum_t2; 	// the sum of each time squared
@@ -45,10 +45,10 @@ void process_cmd_line_args(int argc, char **argv);
 void get_host_address();
 void set_signal_handlers();
 void update_time_stats(float new_time);
-void calculate_checksum(icmp_header_t *headr, int byte_len);
+uint16_t calculate_checksum(uint16_t *pckt, int byte_len);
 
 void print_usage(char *prog_name) {
-	fprintf(stderr, "Usage: %s [-i interval] [-t ttl] destination\n", prog_name);
+	fprintf(stderr, "Usage: %s [-i interval] [-t ttl] [-s packetsize] destination\n", prog_name);
 	exit(2);
 }
 
@@ -75,15 +75,13 @@ int main(int argc, char **argv) {
 		exit(2);
 	}
 	
-	uint16_t uniq_id = getpid();
-	// Prepare the packet to send
-	hdr.type = 8; 	// ICMP Echo Request
-	hdr.code = 0;
-	hdr.identifier = uniq_id; // Use pid as unique identifier
-	hdr.sequence_number = 0;
-
-	set_signal_handlers();
+	// Use this process id as the unique identifier for the packets
+	uniq_id = getpid();
 	
+	set_signal_handlers();
+
+	printf("PING %s %d(%d) bytes of data.\n", hostname, packetsize, packetsize + ICMP_HDR_SIZE + IPV4_HDR_SIZE);
+
 	// Set up timer to send packets periodically
 	struct itimerval timer;
 	timer.it_interval.tv_sec = (int) interval;
@@ -94,16 +92,15 @@ int main(int argc, char **argv) {
 		perror("setitimer");
 		exit(2);
 	}
-
+	
 	// Continually read for echo replies
 	struct timeval end_time;
-	uint8_t in_buf[IPV4_HDR_SIZE + sizeof(icmp_header_t)];
-	icmp_header_t recvd_hdr;
+	uint8_t in_buf[IPV4_HDR_SIZE + ICMP_HDR_SIZE + packetsize];
 	for (;;) {
 		// Receive a reply
 		int num_read = recv(soc_fd, in_buf, sizeof(in_buf), 0);
 		if (errno == EINTR) {
-			// Read call was interrupted by signal
+			// The read call was interrupted by signal
 			continue;
 		}
 		if (num_read < 0) {
@@ -117,23 +114,36 @@ int main(int argc, char **argv) {
 			exit(2);
 		}
 
-		// The ICMP Header begins after the ipv4 header
-		memmove(&recvd_hdr, in_buf + IPV4_HDR_SIZE, sizeof(recvd_hdr));
-
+		uint8_t recvd_type = in_buf[IPV4_HDR_SIZE + TYPE];
+		uint16_t recvd_identifier = *(uint16_t *) (in_buf + IPV4_HDR_SIZE + IDENTIFIER);
 		// Check if echo reply was for this unique process
-		if (recvd_hdr.type != 0 || recvd_hdr.identifier != uniq_id) continue;
+		if (recvd_type != 0 || recvd_identifier != uniq_id) continue;
 
-		// Calculate time taken for packet
-		float time = 1000 * (end_time.tv_sec - recvd_hdr.start_time.tv_sec)
-			+ (float) (end_time.tv_usec - recvd_hdr.start_time.tv_usec) 
-			/ 1000; // in milliseconds
+		nrecvd++;
 
-		update_time_stats(time);
-		
-		// Report round trip
-		printf("%d bytes from %s: icmp_seq=%u ttl=%u time=%0.3f ms\n", 
-				num_read, hostname, recvd_hdr.sequence_number,
-				in_buf[TTL_BYTE], time);
+		// Check if payload size fits timeval
+		if (num_read - IPV4_HDR_SIZE - ICMP_HDR_SIZE >= sizeof(struct timeval)) {
+			struct timeval *start_time = 
+				(struct timeval *) (in_buf + IPV4_HDR_SIZE + ICMP_HDR_SIZE);
+
+			// Calculate time taken for packet
+			float time = 1000 * (end_time.tv_sec - start_time->tv_sec)
+				+ (float) (end_time.tv_usec - start_time->tv_usec) 
+				/ 1000; // in milliseconds
+
+			update_time_stats(time);
+			
+			// Report round trip
+			printf("%d bytes from %s: icmp_seq=%u ttl=%u time=%0.3f ms\n", 
+					num_read, hostname, in_buf[IPV4_HDR_SIZE + SEQ_NUM],
+					in_buf[TTL_BYTE], time);
+		} else {
+			// Report round trip
+			printf("%d bytes from %s: icmp_seq=%u ttl=%u\n", 
+					num_read, hostname, in_buf[IPV4_HDR_SIZE + SEQ_NUM],
+					in_buf[TTL_BYTE]);
+		}
+
 	}
 
 	// Should not reach here
@@ -144,16 +154,37 @@ int main(int argc, char **argv) {
  * Signal handler to update and send a packet.
  */
 void send_packet(int sig) {
-	// Update packet and record start time
-	hdr.sequence_number++;
-	if (gettimeofday(&(hdr.start_time), NULL) == -1) {
-		perror("gettimeofday");
-		exit(2);
+	uint8_t packet[ICMP_HDR_SIZE + packetsize];
+
+	// Prepare the packet to send
+	packet[TYPE] = 8; // ICMP_ECHO Request type
+	packet[CODE] = 0;
+	*((uint16_t *) (packet + IDENTIFIER)) = uniq_id;
+	*((uint16_t *) (packet + SEQ_NUM)) = nsent + 1;
+
+	if (packetsize >= sizeof(struct timeval)) {
+		// Place time at the beginning of the ICMP payload
+		if (gettimeofday((struct timeval *) (packet + ICMP_HDR_SIZE), NULL) == -1) {
+			perror("gettimeofday");
+			exit(2);
+		}
+
+		// Zero the remaining payload
+		for (int i = ICMP_HDR_SIZE + sizeof(struct timeval); i < sizeof(packet); i++) {
+			packet[i] = 0;
+		}
+	} else {
+		// Zero the remaining payload
+		for (int i = ICMP_HDR_SIZE; i < sizeof(packet); i++) {
+			packet[i] = 0;
+		}
 	}
-	calculate_checksum(&hdr, sizeof(hdr));
+	// Initial checksum is 0 for calculation
+	*((uint16_t *) (packet + CHECKSUM)) = 0;
+	*((uint16_t *) (packet + CHECKSUM)) = calculate_checksum((uint16_t *) packet, sizeof(packet));
 
 	// Send the packet
-	if (sendto(soc_fd, &hdr, sizeof(hdr), 0,
+	if (sendto(soc_fd, packet, sizeof(packet), 0,
 				hostaddr, sizeof(*hostaddr)) == -1) {
 		perror("sendto");
 		exit(2);
@@ -168,14 +199,20 @@ void send_packet(int sig) {
 void sigint_h(int sig) {
 	int exit_status = 0;
 	printf("\n--- %s ping statistics ---\n", hostname);
-	printf("%d packets transmitted, %d received\n", nsent, nrecvd);
 	if (nrecvd == 0) {
+		printf("%d packets transmitted, %d received, 100%% packet loss\n", 
+				nsent, nrecvd);
+
 		exit_status = 1;
 	} else { // nrecvd != 0
-		float mean = total_time / nrecvd;
-		printf("rtt min/avg/max/stddev = %0.3f/%0.3f/%0.3f/%0.3f ms\n", 
-				min_time, mean, max_time,
-				sqrtf((sum_t2 / nrecvd) - (mean * mean)));
+		printf("%d packets transmitted, %d received, %.0f%% packet loss\n", 
+				nsent, nrecvd, 100 - 100 * ((float) nrecvd / nsent));
+
+		if (packetsize >= sizeof(struct timeval)) {
+			float mean = total_time / nrecvd;
+			printf("rtt min/avg/max/stddev = %0.3f/%0.3f/%0.3f/%0.3f ms\n", min_time, 
+					mean, max_time, sqrtf((sum_t2 / nrecvd) - (mean * mean)));
+		}
 		exit_status = 0;
 	}
 
@@ -194,7 +231,7 @@ void process_cmd_line_args(int argc, char **argv) {
 
 	// Process options
 	int opt;
-	while ((opt = getopt(argc, argv, "t:i:")) != -1) {
+	while ((opt = getopt(argc, argv, "t:i:s:")) != -1) {
 		switch (opt) {
 			case 't': 
 				ttl = atoi(optarg);
@@ -207,6 +244,13 @@ void process_cmd_line_args(int argc, char **argv) {
 				interval = strtof(optarg, NULL);
 				if (interval < 0.2) {
 					fprintf(stderr, "minimum interval allowed for user is 200ms\n");
+					exit(2);
+				}
+				break;
+			case 's':
+				packetsize = atoi(optarg);
+				if (packetsize < 0) {
+					fprintf(stderr, "illegal negative packet size %d\n", packetsize);
 					exit(2);
 				}
 				break;
@@ -289,10 +333,9 @@ void set_signal_handlers() {
 
 /*
  * Updates values necessary to calculate time statistics
- * and increments <nrecvd>
  */
 void update_time_stats(float new_time) {
-	if (nrecvd == 0) {
+	if (nrecvd == 1) {
 		min_time = new_time;
 		max_time = new_time;
 		total_time = new_time;
@@ -307,33 +350,32 @@ void update_time_stats(float new_time) {
 		total_time += new_time;
 		sum_t2 += (new_time * new_time);
 	}
-
-	nrecvd++;
 }
 
 /*
- * Calculates the checksum of the packet and
- * updates the checksum field accordingly.
- * algorithm from tools.ietf.org/hml/rfc1071#section-4
+ * Calculates the checksum of the packet.
+ * algorithm from tools.ietf.org/html/rfc1071#section-4
  */
-void calculate_checksum(icmp_header_t *headr, int byte_len) {
-	headr->checksum = 0;
-	uint16_t *pckt = (uint16_t *) headr;
-	int32_t sum = 0;
+uint16_t calculate_checksum(uint16_t *pckt, int byte_len) {
+	uint32_t sum = 0;
 	
-	// Will defer the carry of the overflow
-	for (int i = 0; i < byte_len / 2; i += 1) {
+	// Calculuates the 16-bit one's complement sum
+	// 1) Adds adjacent bytes to sum
+	// Defers the adding the overflow
+	for (int i = 0; i < byte_len / 2; i++) {
 		sum += pckt[i];
 	}
 
+	// 2) Handle odd byte case
 	if (byte_len % 2 == 1) {
-		sum += *(uint8_t *) (pckt + byte_len - 1);
+		sum += *(uint8_t *) (pckt + (byte_len / 2));
 	}
 
-	// Add overflows
+	// 3) Add overflows
 	while (sum >> 16) {
 		sum = (sum & 0xffff) + (sum >> 16);
 	}
 
-	headr->checksum = ~sum;
+	// Compute one's complment of one's complement sum
+	return (uint16_t) ~sum;
 }
