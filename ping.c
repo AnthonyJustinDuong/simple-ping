@@ -252,6 +252,10 @@ void process_cmd_line_args(int argc, char **argv) {
 				if (packetsize < 0) {
 					fprintf(stderr, "illegal negative packet size %d\n", packetsize);
 					exit(2);
+				} else if (packetsize > 65535 - ICMP_HDR_SIZE - IPV4_HDR_SIZE) {
+					fprintf(stderr, "packet size %d is too large. Maximum is %d \n", 
+							packetsize, 65535 - ICMP_HDR_SIZE - IPV4_HDR_SIZE);
+					exit(2);
 				}
 				break;
 			default:
